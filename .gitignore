@@ -1,0 +1,4 @@
+moodle_data/
+__pycache__/
+*.pyc
+bot_config.json
