@@ -492,6 +492,24 @@ def fetch_course_sections(session: requests.Session, sesskey: str,
     return sections
 
 
+def fetch_folder_files(session: requests.Session, folder_url: str) -> list:
+    resp = session.get(folder_url, timeout=30)
+    soup = BeautifulSoup(resp.text, 'html.parser')
+    files = []
+    seen = set()
+    for a in soup.select('a[href*="pluginfile.php"]'):
+        href = a.get('href', '')
+        fname = a.get_text(strip=True)
+        if not fname:
+            img = a.find('img', title=True)
+            if img:
+                fname = img['title']
+        if href and fname and href not in seen:
+            seen.add(href)
+            files.append({'name': fname, 'url': href})
+    return files
+
+
 def detect_new_assignments(old_snapshot: dict, new_assignments: list) -> list:
     """
     Returns assignments that are new since the last snapshot.

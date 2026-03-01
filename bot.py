@@ -19,6 +19,7 @@ import random
 import requests
 from requests.adapters  import HTTPAdapter
 from urllib3.util.retry  import Retry
+from bs4 import BeautifulSoup
 from email.mime.text      import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime             import datetime, timezone, timedelta
@@ -33,7 +34,7 @@ from Moodle import (
     unix_to_ist, moodle_login, get_active_session,
     fetch_enrolled_courses, fetch_upcoming_assignments,
     detect_new_items, detect_new_assignments,
-    fetch_course_sections,
+    fetch_course_sections, fetch_folder_files,
 )
 
 logging.basicConfig(
@@ -55,7 +56,15 @@ def load_config() -> dict:
 
 cfg           = load_config()
 BOT_TOKEN     = cfg['bot_token']
-SYNC_INTERVAL = int(cfg.get('sync_interval_minutes', 10)) * 60
+SYNC_INTERVAL_ACTIVE = int(cfg.get('sync_interval_minutes', 10)) * 60
+SYNC_INTERVAL_SLEEP  = int(cfg.get('sync_interval_night_minutes', 60)) * 60
+
+
+def _get_sync_interval() -> int:
+    h = datetime.now(tz=IST).hour
+    if 1 <= h < 8:
+        return SYNC_INTERVAL_SLEEP
+    return SYNC_INTERVAL_ACTIVE
 
 ADMIN_TELEGRAM_USERNAME = cfg.get('admin_telegram_username', 'Darshan_101005')
 ADMIN_PASSWORD          = cfg.get('admin_password',          'Darshan.10102005')
@@ -547,6 +556,9 @@ S_TODO_DELETE      = 'todo_delete'
 S_TODO_EDIT_PICK   = 'todo_edit_pick'
 S_TODO_EDIT_TITLE  = 'todo_edit_title'
 S_TODO_EDIT_DUE    = 'todo_edit_due'
+S_DL_COURSE        = 'dl_course'
+S_DL_FILE          = 'dl_file'
+S_BROADCAST_CUSTOM = 'broadcast_custom'
 
 _otp_store: dict = {}
 _otp_lock = threading.Lock()
@@ -716,8 +728,77 @@ def admin_main_kb() -> InlineKeyboardMarkup:
     )
     kb.add(
         InlineKeyboardButton('🗑 Delete User',         callback_data='adm:ask_del'),
+        InlineKeyboardButton('📢 Broadcast',           callback_data='adm:broadcast'),
     )
     return kb
+
+
+_BROADCAST_TEMPLATES = {
+    'maintenance': (
+        '🛠 <b>Scheduled Maintenance</b>\n\n'
+        'The bot is going down for maintenance. '
+        'Services may be temporarily unavailable.\n'
+        'We\'ll notify you once everything is back online. Thank you for your patience! 🙏'
+    ),
+    'back_online': (
+        '✅ <b>Bot is Back Online!</b>\n\n'
+        'Maintenance is complete and all services are running normally.\n'
+        'Thank you for your patience! 🚀'
+    ),
+    'disruption': (
+        '⚠️ <b>Service Disruption</b>\n\n'
+        'We are experiencing some issues that may affect sync, reminders, or notifications.\n'
+        'Our team is working on it. We\'ll update you once resolved. 🔧'
+    ),
+    'update': (
+        '🆕 <b>Bot Update</b>\n\n'
+        'A new update has been deployed! Expect improved performance and new features.\n'
+        'Type /help to see what\'s new. 🎉'
+    ),
+}
+
+
+def _broadcast_menu_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton('🛠 Maintenance Notice',   callback_data='bcast:maintenance'),
+        InlineKeyboardButton('✅ Back Online',           callback_data='bcast:back_online'),
+        InlineKeyboardButton('⚠️ Service Disruption',    callback_data='bcast:disruption'),
+        InlineKeyboardButton('🆕 Bot Update',            callback_data='bcast:update'),
+        InlineKeyboardButton('✏️ Custom Message',        callback_data='bcast:custom'),
+    )
+    kb.add(InlineKeyboardButton('❌ Cancel', callback_data='bcast:cancel'))
+    return kb
+
+
+def _broadcast_confirm_kb(key: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton('📢 Send to All', callback_data=f'bcast_ok:{key}'),
+        InlineKeyboardButton('❌ Cancel',      callback_data='bcast_ok:cancel'),
+    )
+    return kb
+
+
+def _do_broadcast(chat_id: int, text: str):
+    with _bot_users_lock:
+        bu = load_bot_users()
+    targets = [int(cid) for cid, info in bu.items()
+               if not info.get('blocked')]
+    sent = 0
+    failed = 0
+    for cid in targets:
+        try:
+            bot.send_message(cid, text, disable_web_page_preview=True, parse_mode='HTML')
+            sent += 1
+        except Exception as e:
+            log.warning("Broadcast to %s failed: %s", cid, e)
+            failed += 1
+    bot.send_message(chat_id,
+        f"📢 <b>Broadcast Complete</b>\n\n"
+        f"✅ Sent: <b>{sent}</b>\n"
+        f"❌ Failed: <b>{failed}</b>\n"
+        f"👥 Total active: <b>{len(targets)}</b>")
 
 
 def notif_pref_kb(current_pref: str) -> InlineKeyboardMarkup:
@@ -839,8 +920,116 @@ def bot_get_session(username: str):
     return get_active_session(username, password, users_db)
 
 
+def _extract_file_url_from_html(html_text: str) -> str:
+    soup = BeautifulSoup(html_text, 'html.parser')
+    source = soup.find('source', src=True)
+    if source and 'pluginfile.php' in source.get('src', ''):
+        return source['src']
+    fallback_a = soup.select_one('a.mediafallbacklink[href]')
+    if fallback_a and 'pluginfile.php' in fallback_a['href']:
+        return fallback_a['href']
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        if 'pluginfile.php' in href and 'forcedownload' in href:
+            return href
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        if 'pluginfile.php' in href:
+            return href
+    for tag in soup.find_all(['object', 'embed']):
+        src = tag.get('data') or tag.get('src', '')
+        if 'pluginfile.php' in src:
+            return src
+    iframe = soup.find('iframe', src=True)
+    if iframe and 'pluginfile.php' in iframe.get('src', ''):
+        return iframe['src']
+    return ''
+
+
+def _extract_actual_url(session, moodle_url: str) -> str:
+    try:
+        resp = session.get(moodle_url, timeout=30)
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        wa = soup.select_one('.urlworkaround a[href]')
+        if wa:
+            return wa['href']
+        iframe = soup.select_one('iframe[src]')
+        if iframe:
+            return iframe['src']
+        meta = soup.find('meta', attrs={'http-equiv': 'refresh'})
+        if meta:
+            m = re.search(r'url=(.+)', meta.get('content', ''), re.I)
+            if m:
+                return m.group(1).strip()
+    except Exception:
+        pass
+    return ''
+
+
+_EXT_MAP = {
+    'application/pdf':   '.pdf',
+    'application/msword': '.doc',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+    'application/vnd.ms-excel': '.xls',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+    'application/vnd.ms-powerpoint': '.ppt',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
+    'text/plain':  '.txt',
+    'image/jpeg':  '.jpg',
+    'image/png':   '.png',
+    'image/gif':   '.gif',
+    'video/mp4':   '.mp4',
+    'video/webm':  '.webm',
+    'audio/mpeg':  '.mp3',
+    'application/zip': '.zip',
+    'application/x-rar-compressed': '.rar',
+    'application/x-7z-compressed':  '.7z',
+}
+
+
+def _send_file_from_response(resp, name: str, chat_id: int, course_name: str, fallback_url: str):
+    content_type = resp.headers.get('Content-Type', '')
+    content_disp = resp.headers.get('Content-Disposition', '')
+    filename = name
+    m = re.search(r'filename[*]?=["\']?([^"\';\n]+)', content_disp)
+    if m:
+        filename = m.group(1).strip().strip('"\'')
+    for mime, ext in _EXT_MAP.items():
+        if mime in content_type and not filename.lower().endswith(ext):
+            filename += ext
+            break
+    MAX_BYTES = 49 * 1024 * 1024
+    data = b''
+    for chunk in resp.iter_content(chunk_size=65536):
+        data += chunk
+        if len(data) > MAX_BYTES:
+            bot.send_message(chat_id,
+                f"📄 <b>{name}</b> — too large to forward (>49 MB)\n"
+                f"📚 {course_name}\n<a href=\"{fallback_url}\">Download manually</a>")
+            return
+    if not data:
+        bot.send_message(chat_id,
+            f"📄 <b>{name}</b> — empty file (0 bytes)\n"
+            f"📚 {course_name}\n<a href=\"{fallback_url}\">Open in Moodle</a>")
+        return
+    file_obj = io.BytesIO(data)
+    file_obj.name = filename
+    bot.send_document(chat_id, file_obj,
+                      caption=f"📄 <b>{name}</b>\n📚 {course_name}", parse_mode='HTML')
+    log.info("Sent file '%s' (%d KB) to chat %s", filename, len(data) // 1024, chat_id)
+
+
+_VIDEO_EXTS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv', '.m4v'}
+_VIDEO_MIMES = {'video/mp4', 'video/webm', 'video/x-matroska', 'video/avi',
+                'video/quicktime', 'video/x-flv', 'video/x-ms-wmv'}
+
+_SKIP_DOWNLOAD = {'forum', 'assign', 'assignment', 'quiz', 'feedback',
+                  'choice', 'data', 'glossary', 'wiki', 'lesson',
+                  'scorm', 'survey', 'workshop', 'chat', 'label',
+                  'page', 'book', 'lti', 'h5pactivity', 'bigbluebuttonbn'}
+
+
 def download_and_send_file(session, item: dict, chat_id: int, course_name: str):
-    """Download a Moodle resource and send as Telegram document."""
     modname = (item.get('modname') or '').lower()
     url     = item.get('url', '')
     name    = item.get('name', 'file')
@@ -849,64 +1038,99 @@ def download_and_send_file(session, item: dict, chat_id: int, course_name: str):
         return
 
     if modname == 'url':
+        actual = _extract_actual_url(session, url)
+        link = actual if actual else url
         bot.send_message(chat_id,
-            f"🔗 <b>New Link:</b> {name}\n"
-            f"📚 {course_name}\n<a href=\"{url}\">{url}</a>",
+            f"🔗 <b>{name}</b>\n"
+            f"📚 {course_name}\n<a href=\"{link}\">{link}</a>",
             disable_web_page_preview=False,
         )
         return
 
-    try:
-        resp         = session.get(url, allow_redirects=True, timeout=30, stream=True)
-        content_type = resp.headers.get('Content-Type', '')
-        content_disp = resp.headers.get('Content-Disposition', '')
+    if modname in _SKIP_DOWNLOAD:
+        icon = '📋' if modname in ('assign', 'assignment') else '📌'
+        bot.send_message(chat_id,
+            f"{icon} <b>{name}</b>\n"
+            f"📚 {course_name}\n<a href=\"{url}\">Open in Moodle</a>",
+            disable_web_page_preview=True,
+        )
+        return
 
-        filename = name
-        m = re.search(r'filename[*]?=["\']?([^"\';\n]+)', content_disp)
-        if m:
-            filename = m.group(1).strip().strip('"\'')
-
-        ext_map = {
-            'application/pdf':   '.pdf',
-            'application/msword': '.doc',
-            'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
-            'application/vnd.ms-excel': '.xls',
-            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
-            'application/vnd.ms-powerpoint': '.ppt',
-            'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
-            'text/plain':  '.txt',
-            'image/jpeg':  '.jpg',
-            'image/png':   '.png',
-            'application/zip': '.zip',
-        }
-        for mime, ext in ext_map.items():
-            if mime in content_type and not filename.lower().endswith(ext):
-                filename += ext
-                break
-
-        MAX_BYTES = 49 * 1024 * 1024
-        data      = b''
-        for chunk in resp.iter_content(chunk_size=65536):
-            data += chunk
-            if len(data) > MAX_BYTES:
+    if modname == 'folder':
+        try:
+            folder_files = fetch_folder_files(session, url)
+            if not folder_files:
                 bot.send_message(chat_id,
-                    f"📄 <b>{name}</b> — too large to forward (>49 MB)\n"
-                    f"📚 {course_name}\n<a href=\"{url}\">Download manually</a>",
-                )
+                    f"📁 <b>{name}</b> — empty folder\n"
+                    f"📚 {course_name}\n<a href=\"{url}\">Open in Moodle</a>")
                 return
+            for ff in folder_files:
+                try:
+                    r = session.get(ff['url'], allow_redirects=True, timeout=60, stream=True)
+                    _send_file_from_response(r, ff['name'], chat_id, course_name, ff['url'])
+                except Exception as e2:
+                    log.warning("Folder file failed '%s': %s", ff['name'], e2)
+                    bot.send_message(chat_id,
+                        f"📄 <b>{ff['name']}</b> — download failed\n"
+                        f"📚 {course_name}\n<a href=\"{ff['url']}\">Download manually</a>")
+        except Exception as e:
+            log.warning("Folder download failed for '%s': %s", name, e)
+            bot.send_message(chat_id,
+                f"📁 <b>{name}</b> — could not open folder\n"
+                f"📚 {course_name}\n<a href=\"{url}\">Open in Moodle</a>")
+        return
 
-        file_obj      = io.BytesIO(data)
-        file_obj.name = filename
-        bot.send_document(chat_id, file_obj,
-                          caption=f"📄 <b>{name}</b>\n📚 {course_name}", parse_mode='HTML')
-        log.info("Sent file '%s' to chat %s", filename, chat_id)
+    try:
+        resp = session.get(url, allow_redirects=True, timeout=30, stream=True)
+        content_type = resp.headers.get('Content-Type', '')
+
+        if any(vm in content_type for vm in _VIDEO_MIMES):
+            bot.send_message(chat_id,
+                f"🎬 <b>{name}</b>\n"
+                f"📚 {course_name}\n\n"
+                f"▶️ <a href=\"{resp.url}\">Play / Download video</a>\n"
+                f"🔗 <a href=\"{url}\">Open in Moodle</a>",
+                disable_web_page_preview=True)
+            return
+
+        if 'text/html' in content_type:
+            html_body = resp.text
+            file_url = _extract_file_url_from_html(html_body)
+            if file_url:
+                if any(file_url.lower().endswith(ext) or ext + '?' in file_url.lower()
+                       for ext in _VIDEO_EXTS):
+                    bot.send_message(chat_id,
+                        f"🎬 <b>{name}</b>\n"
+                        f"📚 {course_name}\n\n"
+                        f"▶️ <a href=\"{file_url}\">Play / Download video</a>\n"
+                        f"🔗 <a href=\"{url}\">Open in Moodle</a>",
+                        disable_web_page_preview=True)
+                    return
+                resp2 = session.head(file_url, allow_redirects=True, timeout=15)
+                ct2 = resp2.headers.get('Content-Type', '')
+                if any(vm in ct2 for vm in _VIDEO_MIMES):
+                    bot.send_message(chat_id,
+                        f"🎬 <b>{name}</b>\n"
+                        f"📚 {course_name}\n\n"
+                        f"▶️ <a href=\"{file_url}\">Play / Download video</a>\n"
+                        f"🔗 <a href=\"{url}\">Open in Moodle</a>",
+                        disable_web_page_preview=True)
+                    return
+                resp2 = session.get(file_url, allow_redirects=True, timeout=60, stream=True)
+                _send_file_from_response(resp2, name, chat_id, course_name, url)
+            else:
+                bot.send_message(chat_id,
+                    f"📄 <b>{name}</b> — embedded content, open in browser\n"
+                    f"📚 {course_name}\n<a href=\"{url}\">Open in Moodle</a>")
+            return
+
+        _send_file_from_response(resp, name, chat_id, course_name, url)
 
     except Exception as e:
         log.warning("File download failed for '%s': %s", name, e)
         bot.send_message(chat_id,
             f"📄 <b>{name}</b> — could not auto-download.\n"
-            f"📚 {course_name}\n<a href=\"{url}\">Open in Moodle</a>",
-        )
+            f"📚 {course_name}\n<a href=\"{url}\">Open in Moodle</a>")
 
 
 def _send_signup_summary(username: str, chat_id: int):
@@ -997,6 +1221,7 @@ def cmd_help(message):
         "📚 <b>Moodle</b>\n"
         "  /enrolled_courses           – View all courses\n"
         "  /pending_assignments        – View pending deadlines\n"
+        "  /download_files             – Download files from a course\n"
         "  /sync                       – Force immediate sync\n"
         "  /status                     – Summary + last sync info\n\n"
         "📋 <b>Todo</b>\n"
@@ -1010,6 +1235,7 @@ def cmd_help(message):
         "  Per assignment: ✅ Done  💤 Snooze  ⏰ Custom  🔕 Mute\n\n"
         "🛡 <b>Admin</b>\n"
         "  /admin_panel                – Admin management panel\n"
+        "  /broadcast                  – Broadcast message to all users\n"
     )
 
 
@@ -1248,7 +1474,7 @@ def cmd_status(message):
         f"🔔 Notifications: <b>{pref_label}</b>\n\n"
         f"🔄 Courses synced:     {course_data.get('last_synced', 'never')}\n"
         f"🔄 Assignments synced: {assign_data.get('last_synced', 'never')}\n"
-        f"⏱ Auto-sync every {SYNC_INTERVAL // 60} min"
+        f"⏱ Auto-sync every {_get_sync_interval() // 60} min ({'🌙 night mode' if 1 <= datetime.now(tz=IST).hour < 8 else '☀️ active'})"
     )
 
 
@@ -1269,6 +1495,44 @@ def cmd_notification_preferences(message):
         "and assignment notifications:" + note,
         reply_markup=notif_pref_kb(pref),
     )
+
+
+@bot.message_handler(commands=['download_files'])
+@require_signup
+def cmd_download_files(message):
+    username = get_moodle_username(message.chat.id)
+    wait_msg = bot.reply_to(message, "⏳ Fetching courses…")
+    try:
+        session, sesskey = bot_get_session(username)
+        courses = fetch_enrolled_courses(session, sesskey)
+    except Exception as e:
+        bot.edit_message_text(f"❌ Error: {e}", wait_msg.chat.id, wait_msg.message_id)
+        return
+    if not courses:
+        bot.edit_message_text("📭 No courses found.", wait_msg.chat.id, wait_msg.message_id)
+        return
+    lines = ["📚 <b>Select a course</b>\n"]
+    course_list = []
+    for idx, c in enumerate(courses, 1):
+        course_list.append({
+            'course_id': c['course_id'],
+            'name': c['full_display_name'],
+        })
+        lines.append(f"  <b>{idx}.</b> {c['full_display_name']}")
+    lines.append("\n📝 Reply with the <b>course number</b>:")
+    set_state(message.chat.id, S_DL_COURSE, {'courses': course_list})
+    _send_long(message.chat.id, '\n'.join(lines), wait_msg)
+
+
+@bot.message_handler(commands=['broadcast'])
+def cmd_broadcast(message):
+    if not (is_admin_user(message) or admin_is_authed(message.chat.id)):
+        bot.reply_to(message, "❌ Admin only.")
+        return
+    bot.reply_to(message,
+        "📢 <b>Broadcast Message</b>\n\n"
+        "Choose a template or write a custom message:",
+        reply_markup=_broadcast_menu_kb())
 
 
 @bot.message_handler(commands=['admin_panel'])
@@ -1303,6 +1567,29 @@ def handle_text(message):
     s    = st['state']
     data = st['data']
     text = message.text.strip()
+
+    if s == S_IDLE and text.startswith('/'):
+        bot.reply_to(message,
+            "❓ Unknown command.\nUse /help to see all available commands.")
+        return
+
+    if s == S_BROADCAST_CUSTOM:
+        clear_state(chat_id)
+        preview = text.strip()
+        if not preview:
+            bot.reply_to(message, "❌ Empty message. Broadcast cancelled.")
+            return
+        set_state(chat_id, S_IDLE, {'bcast_text': preview})
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            InlineKeyboardButton('📢 Send to All', callback_data='bcast_ok:custom_confirm'),
+            InlineKeyboardButton('❌ Cancel',      callback_data='bcast_ok:cancel'),
+        )
+        bot.reply_to(message,
+            f"📢 <b>Preview:</b>\n\n{preview}\n\n"
+            f"<i>This will be sent to all active users.</i>",
+            reply_markup=kb)
+        return
 
     if s == S_ADMIN_TEXT:
         clear_state(chat_id)
@@ -1588,6 +1875,126 @@ def handle_text(message):
         )
         return
 
+    if s == S_DL_COURSE:
+        course_list = data.get('courses', [])
+        try:
+            choice = int(text)
+        except ValueError:
+            bot.reply_to(message, "❌ Enter a valid course number:",
+                         reply_markup=ForceReply(selective=True))
+            return
+        if choice < 1 or choice > len(course_list):
+            bot.reply_to(message,
+                f"❌ Enter a number between 1 and {len(course_list)}:",
+                reply_markup=ForceReply(selective=True))
+            return
+        picked = course_list[choice - 1]
+        username = get_moodle_username(chat_id)
+        wait_msg = bot.reply_to(message, f"⏳ Fetching files for <b>{picked['name']}</b>…")
+        try:
+            session, sesskey = bot_get_session(username)
+            sections = fetch_course_sections(session, sesskey, picked['course_id'])
+        except Exception as e:
+            clear_state(chat_id)
+            bot.edit_message_text(f"❌ Error: {e}", wait_msg.chat.id, wait_msg.message_id)
+            return
+        _DL_MODNAMES = {'file', 'resource', 'folder', 'url'}
+        file_list = []
+        for sec in sections:
+            for item in sec.get('items', []):
+                if (item.get('modname') or '').lower() in _DL_MODNAMES:
+                    file_list.append({
+                        'id': item['id'],
+                        'name': item.get('name', 'Unknown'),
+                        'modname': (item.get('modname') or '').lower(),
+                        'url': item.get('url', ''),
+                        'section': sec.get('section_title', ''),
+                    })
+        if not file_list:
+            clear_state(chat_id)
+            bot.edit_message_text(
+                f"📭 No downloadable files found in <b>{picked['name']}</b>.",
+                wait_msg.chat.id, wait_msg.message_id)
+            return
+        lines = [f"📁 <b>Files in {picked['name']}</b> ({len(file_list)} items)\n"]
+        for idx, f_item in enumerate(file_list, 1):
+            mn = f_item['modname']
+            icon = '🔗' if mn == 'url' else ('📁' if mn == 'folder' else '📄')
+            lines.append(f"  <b>{idx}.</b> {icon} {f_item['name']}")
+            if f_item['section']:
+                lines[-1] += f"  <i>({f_item['section']})</i>"
+        lines.append(
+            "\n📝 Reply with file number(s):\n"
+            "  • Single: <code>2</code>\n"
+            "  • Range: <code>2-5</code>\n"
+            "  • Selective: <code>1 4 5</code>\n"
+            "  • All: <code>all</code>"
+        )
+        set_state(chat_id, S_DL_FILE, {
+            'files': file_list,
+            'course_name': picked['name'],
+        })
+        _send_long(chat_id, '\n'.join(lines), wait_msg)
+        return
+
+    if s == S_DL_FILE:
+        file_list   = data.get('files', [])
+        course_name = data.get('course_name', '')
+        total       = len(file_list)
+        indices     = set()
+        raw         = text.strip().lower()
+        if raw == 'all':
+            indices = set(range(1, total + 1))
+        else:
+            for part in raw.replace(',', ' ').split():
+                part = part.strip()
+                if not part:
+                    continue
+                m = re.match(r'^(\d+)\s*-\s*(\d+)$', part)
+                if m:
+                    a, b = int(m.group(1)), int(m.group(2))
+                    if a > b:
+                        a, b = b, a
+                    for i in range(a, b + 1):
+                        indices.add(i)
+                elif re.match(r'^\d+$', part):
+                    indices.add(int(part))
+        invalid = [i for i in indices if i < 1 or i > total]
+        if not indices or invalid:
+            msg = "❌ Invalid input."
+            if invalid:
+                msg += f" Numbers {invalid} out of range (1-{total})."
+            msg += (
+                "\n\nEnter file number(s):\n"
+                "  • Single: <code>2</code>\n"
+                "  • Range: <code>2-5</code>\n"
+                "  • Selective: <code>1 4 5</code>\n"
+                "  • All: <code>all</code>"
+            )
+            bot.reply_to(message, msg, reply_markup=ForceReply(selective=True))
+            return
+        chosen = sorted(indices)
+        username = get_moodle_username(chat_id)
+        clear_state(chat_id)
+        bot.reply_to(message, f"⏳ Downloading {len(chosen)} file(s)…")
+        try:
+            session, sesskey = bot_get_session(username)
+        except Exception as e:
+            bot.send_message(chat_id, f"❌ Session error: {e}")
+            return
+        for idx in chosen:
+            f_item = file_list[idx - 1]
+            download_and_send_file(session, f_item, chat_id, course_name)
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            InlineKeyboardButton('📚 Download more', callback_data='dl:more'),
+            InlineKeyboardButton('✅ Done',          callback_data='dl:done'),
+        )
+        bot.send_message(chat_id,
+            f"✅ Done — sent {len(chosen)} file(s) from <b>{course_name}</b>.",
+            reply_markup=kb)
+        return
+
     if s == S_TODO_TITLE:
         username = get_moodle_username(chat_id)
         if not username:
@@ -1818,6 +2225,128 @@ def handle_callback(call):
             return
         _safe_answer(call.id)
         _handle_admin_callback(call, param)
+        return
+
+    if action == 'bcast':
+        if not (is_admin_user(call) or admin_is_authed(chat_id)):
+            _safe_answer(call.id, "❌ Admin only.")
+            return
+        _safe_answer(call.id)
+        if param == 'cancel':
+            try:
+                bot.edit_message_text("❌ Broadcast cancelled.",
+                    chat_id, call.message.message_id)
+            except Exception:
+                pass
+            return
+        if param == 'custom':
+            set_state(chat_id, S_BROADCAST_CUSTOM)
+            try:
+                bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+            except Exception:
+                pass
+            bot.send_message(chat_id,
+                "✏️ Type your <b>custom broadcast message</b>:\n\n"
+                "<i>Supports HTML formatting (bold, italic, links).</i>\n"
+                "Send /cancel to abort.",
+                reply_markup=ForceReply(selective=True))
+            return
+        if param in _BROADCAST_TEMPLATES:
+            preview = _BROADCAST_TEMPLATES[param]
+            try:
+                bot.edit_message_text(
+                    f"📢 <b>Preview:</b>\n\n{preview}\n\n"
+                    f"<i>This will be sent to all active users.</i>",
+                    chat_id, call.message.message_id,
+                    parse_mode='HTML',
+                    reply_markup=_broadcast_confirm_kb(param))
+            except Exception:
+                pass
+            return
+        return
+
+    if action == 'bcast_ok':
+        if not (is_admin_user(call) or admin_is_authed(chat_id)):
+            _safe_answer(call.id, "❌ Admin only.")
+            return
+        _safe_answer(call.id)
+        if param == 'cancel':
+            try:
+                bot.edit_message_text("❌ Broadcast cancelled.",
+                    chat_id, call.message.message_id)
+            except Exception:
+                pass
+            return
+        if param == 'custom_confirm':
+            st = get_state(chat_id)
+            text_to_send = st.get('data', {}).get('bcast_text', '')
+            clear_state(chat_id)
+            if not text_to_send:
+                try:
+                    bot.edit_message_text("❌ No message to send.",
+                        chat_id, call.message.message_id)
+                except Exception:
+                    pass
+                return
+            try:
+                bot.edit_message_text("📢 Broadcasting…",
+                    chat_id, call.message.message_id)
+            except Exception:
+                pass
+            _do_broadcast(chat_id, text_to_send)
+            return
+        text_to_send = _BROADCAST_TEMPLATES.get(param, '')
+        if not text_to_send:
+            return
+        try:
+            bot.edit_message_text("📢 Broadcasting…",
+                chat_id, call.message.message_id)
+        except Exception:
+            pass
+        _do_broadcast(chat_id, text_to_send)
+        return
+
+    if action == 'dl':
+        if param == 'done':
+            _safe_answer(call.id, "👍 Done!")
+            try:
+                bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+            except Exception:
+                pass
+            return
+        if param == 'more':
+            _safe_answer(call.id)
+            try:
+                bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+            except Exception:
+                pass
+            username = get_moodle_username(chat_id)
+            if not username:
+                bot.send_message(chat_id, "Please /signup first.")
+                return
+            wait_msg = bot.send_message(chat_id, "⏳ Fetching courses…")
+            try:
+                session, sesskey = bot_get_session(username)
+                courses = fetch_enrolled_courses(session, sesskey)
+            except Exception as e:
+                bot.edit_message_text(f"❌ Error: {e}", wait_msg.chat.id, wait_msg.message_id)
+                return
+            if not courses:
+                bot.edit_message_text("📭 No courses found.", wait_msg.chat.id, wait_msg.message_id)
+                return
+            lines = ["📚 <b>Select a course</b>\n"]
+            course_list = []
+            for idx, c in enumerate(courses, 1):
+                course_list.append({
+                    'course_id': c['course_id'],
+                    'name': c['full_display_name'],
+                })
+                lines.append(f"  <b>{idx}.</b> {c['full_display_name']}")
+            lines.append("\n📝 Reply with the <b>course number</b>:")
+            set_state(chat_id, S_DL_COURSE, {'courses': course_list})
+            _send_long(chat_id, '\n'.join(lines), wait_msg)
+            return
+        _safe_answer(call.id)
         return
 
     if action == 'todoadd':
@@ -2171,6 +2700,13 @@ def _handle_admin_callback(call, action: str):
         )
         return
 
+    if action == 'broadcast':
+        bot.send_message(chat_id,
+            "📢 <b>Broadcast Message</b>\n\n"
+            "Choose a template or write a custom message:",
+            reply_markup=_broadcast_menu_kb())
+        return
+
     prompt_map = {
         'ask_assign':   ('📋 Enter Moodle username to view assignments:',   'view_assign'),
         'ask_block':    ('🚫 Enter Chat ID or Moodle username to block:',    'block'),
@@ -2216,13 +2752,20 @@ def _do_sync(username: str, chat_id: int = None, is_initial: bool = False):
         if old_course_data and not is_initial:
             new_items = detect_new_items(old_course_data, snapshot)
             if new_items and chat_id:
+                _ITEM_ICONS = {
+                    'file': '📄', 'resource': '📄', 'folder': '📁',
+                    'url': '🔗', 'assign': '📋', 'assignment': '📋',
+                    'forum': '💬', 'quiz': '❓', 'page': '📃',
+                }
                 lines = [f"🆕 <b>{len(new_items)} new item(s) added on Moodle!</b>\n"]
                 for item in new_items:
                     if item.get('type') == 'new_course':
                         lines.append(f"📚 New course: <b>{item.get('course_name')}</b>")
                     else:
+                        mn = (item.get('modname') or '').lower()
+                        icon = _ITEM_ICONS.get(mn, '📌')
                         lines.append(
-                            f"📄 <b>{item.get('course_name')}</b> › {item.get('section_title')}\n"
+                            f"{icon} <b>{item.get('course_name')}</b> › {item.get('section_title')}\n"
                             f"  {item.get('item_name')} ({item.get('modname','')})"
                         )
                 if notif_tg:
@@ -2416,7 +2959,7 @@ def _background_sync_loop():
                 _do_sync(username, chat_id=int(cid_str))
             except Exception as e:
                 log.error("BG sync error for %s: %s", username, e)
-        time.sleep(SYNC_INTERVAL)
+        time.sleep(_get_sync_interval())
 
 
 def _reminder_loop():
