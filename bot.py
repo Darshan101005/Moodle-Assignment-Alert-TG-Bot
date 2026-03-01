@@ -174,7 +174,7 @@ def _build_html_email(title: str, content_html: str, footer_note: str = '') -> s
 <div class="wrapper">
   <div class="card">
     <div class="header">
-      <div class="header-icon"><img src="https://i.ibb.co/YF62jxY3/moodle-logo.png" alt="Moodle" style="width:330px;max-width:80%;height:auto;display:inline-block;"></div>
+      <div class="header-icon"><img src="https://upload.wikimedia.org/wikipedia/commons/thumb/c/c6/Moodle-logo.svg/1280px-Moodle-logo.svg.png" alt="Moodle" style="width:330px;max-width:80%;height:auto;display:inline-block;"></div>
       <h1>Moodle Monitor</h1>
       <p>{title}</p>
     </div>
